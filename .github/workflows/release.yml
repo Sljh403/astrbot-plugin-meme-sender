@@ -1,0 +1,103 @@
+name: Release Plugin Package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签，例如 v1.4.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          NAME="$(sed -n 's/^name:[[:space:]]*//p' metadata.yaml | head -n1 | tr -d '\r\"'"'"'')"
+          VERSION="$(sed -n 's/^version:[[:space:]]*//p' metadata.yaml | head -n1 | tr -d '\r\"'"'"'')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "plugin=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "package=${NAME}-${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Compile check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile main.py
+          echo "py_compile OK"
+
+      - name: Build release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="${{ steps.meta.outputs.package }}"
+          mkdir -p "dist/${PKG}"
+          cp main.py metadata.yaml README.md "dist/${PKG}/"
+          cp .gitignore "dist/${PKG}/" 2>/dev/null || true
+          ( cd dist && zip -r "${PKG}.zip" "${PKG}" )
+          ( cd dist && tar -czf "${PKG}.tar.gz" "${PKG}" )
+          ls -lh dist
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.package }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+          body: |
+            ## AstrBot 插件包
+
+            - 插件：`${{ steps.meta.outputs.plugin }}`
+            - 版本：`${{ steps.meta.outputs.version }}`
+
+            ### 下载
+
+            | 格式 | 文件 |
+            | --- | --- |
+            | ZIP | `${{ steps.meta.outputs.package }}.zip` |
+            | TAR.GZ | `${{ steps.meta.outputs.package }}.tar.gz` |
+
+            解压后目录名即插件名，可直接放入 AstrBot 插件目录：
+
+            ```text
+            <AstrBot 数据目录>/plugins/${{ steps.meta.outputs.plugin }}/
+            ```
+
+            然后确认 `cmd_config.json` 的 `plugin_set` 包含 `${{ steps.meta.outputs.plugin }}`，重启 AstrBot。

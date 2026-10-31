@@ -1,5 +1,9 @@
 # astrbot-plugin-meme-sender
 
+[![Release](https://img.shields.io/github/v/release/Sljh403/astrbot-plugin-meme-sender?label=release&color=blue)](https://github.com/Sljh403/astrbot-plugin-meme-sender/releases)
+[![Downloads](https://img.shields.io/github/downloads/Sljh403/astrbot-plugin-meme-sender/total?label=downloads)](https://github.com/Sljh403/astrbot-plugin-meme-sender/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 AstrBot 表情包 / 本地图库自动配图插件。它会读取聊天上下文，从图库中挑选与当前回复语义适配的图片或表情包，追加在文字回复后面发送；不替换、不删除原有文字。
 
 ## 功能介绍
@@ -41,7 +45,45 @@ AstrBot 表情包 / 本地图库自动配图插件。它会读取聊天上下文
 
 分析失败不会阻塞入库或聊天：插件会退回文件名/描述规则标注，并在素材上标记识别失败。
 
-## 安装
+## 下载安装
+
+### 方式一：GitHub Release（推荐）
+
+前往 [Releases](https://github.com/Sljh403/astrbot-plugin-meme-sender/releases) 下载最新的插件包：
+
+| 格式 | 说明 |
+| --- | --- |
+| `airz_media-<版本>.zip` | Windows 推荐 |
+| `airz_media-<版本>.tar.gz` | Linux 推荐 |
+
+解压后得到一个 `airz_media` 目录，放入 AstrBot 插件目录即可：
+
+```text
+<AstrBot 数据目录>/plugins/airz_media/
+├── main.py
+├── metadata.yaml
+└── README.md
+```
+
+### 方式二：命令行下载
+
+```bash
+# 下载最新 Release 的 zip（需要 gh 或 curl）
+gh release download --repo Sljh403/astrbot-plugin-meme-sender --pattern "*.zip"
+
+# 或直接下载源码压缩包
+curl -L -o astrbot-plugin-meme-sender.zip   https://github.com/Sljh403/astrbot-plugin-meme-sender/archive/refs/heads/main.zip
+```
+
+### 方式三：Git 克隆
+
+```bash
+git clone https://github.com/Sljh403/astrbot-plugin-meme-sender.git
+```
+
+把仓库内容复制到插件目录并重命名为 `airz_media`。
+
+## 从源码安装
 
 把仓库放到 AstrBot 插件目录，例如：
 
