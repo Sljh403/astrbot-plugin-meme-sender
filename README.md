@@ -208,4 +208,4 @@ Plugin airz_media (1.4.1)
 
 > 该插件支持任意修改，如修改发送逻辑判定，分析模型选取等。转载需附带原地址。
 
-原地址：https://github.com/guoyibo466-rgb/astrbot-plugin-meme-sender
+原地址：https://github.com/Sljh403/astrbot-plugin-meme-sender
