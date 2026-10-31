@@ -5,6 +5,7 @@ import base64
 import hashlib
 import io
 import json
+import random
 import re
 import sqlite3
 import time
@@ -80,8 +81,12 @@ def _db_default(root: Path) -> dict[str, Any]:
         "sticker_dir": str(root / "stickers"),
         "sticker_sync_count": 20,
         "native_sticker": True,
-        "min_score": 0.30,
-        "context_weight": 0.70,
+        "min_score": 0.40,
+        "base_weight": 0.25,
+        "context_weight": 0.45,
+        "emotion_weight": 0.30,
+        "send_probability": 0.80,
+        "direct_fit_threshold": 0.80,
         "allow_group": True,
         "allow_private": True,
         "max_image_mb": 10,
@@ -371,7 +376,7 @@ class MediaStore:
     name=PLUGIN_NAME,
     author="A.I.R Z",
     desc="按聊天语境自动挑选表情包或本地图库图片，支持图库管理与语义标注",
-    version="1.4.1",
+    version="1.5.0",
 )
 class AirzMediaPlugin(star.Star):
     def __init__(self, context: star.Context, config: Any = None) -> None:
@@ -762,9 +767,13 @@ class AirzMediaPlugin(star.Star):
                 f"自动发送：{'开' if self.config.get('enabled') and self.config.get('auto_send') else '关'}\n"
                 f"图库目录：{self.gallery_dir}\n"
                 f"表情目录：{self.sticker_dir}\n"
-                f"语义分析：{vision}｜语境阈值：>={float(self.config.get('min_score', 0.30)):.2f}｜"
-                f"语境权重：{float(self.config.get('context_weight', 0.70)) * 100:.0f}%｜"
-                f"算法判定：达标即发｜次数/间隔：不限"
+                f"语义分析：{vision}｜分数兜底阈值：>{float(self.config.get('min_score', 0.40)):.2f}｜"
+                f"权重 基础/语境/情绪：{float(self.config.get('base_weight', 0.25)) * 100:.0f}%/"
+                f"{float(self.config.get('context_weight', 0.45)) * 100:.0f}%/"
+                f"{float(self.config.get('emotion_weight', 0.30)) * 100:.0f}%｜"
+                f"直发：语境或情绪≥{float(self.config.get('direct_fit_threshold', 0.80)):.2f}｜"
+                f"兜底：>{float(self.config.get('min_score', 0.40)):.2f} 时 "
+                f"{float(self.config.get('send_probability', 0.80)) * 100:.0f}%｜次数/间隔：不限"
             )
         if sub == "list":
             kind = arg.lower().strip()
@@ -1171,6 +1180,18 @@ class AirzMediaPlugin(star.Star):
         # 关键词只占 30%，防止“文字里有同一个词”被当成语境适配。
         return max(0.0, min(1.0, 0.30 * kw_score + 0.35 * scenario_score + 0.35 * semantic_score))
 
+    def _emotion_heuristic(self, row: dict[str, Any], ctx_text: str, reply_text: str) -> float:
+        """情绪启发分：回复文字的情绪优先，其次看最近对话情绪与素材情绪标签的匹配。"""
+        emotions = {e for e in _json_list(row.get("emotions")) if e and e != "中性"}
+        if not emotions:
+            return 0.0
+        reply_emos = {e for e in self._emotions_in(reply_text or "") if e != "中性"}
+        ctx_emos = {e for e in self._emotions_in(ctx_text or "") if e != "中性"}
+        reply_match = len(reply_emos & emotions) / max(1, len(reply_emos)) if reply_emos else 0.0
+        ctx_match = len(ctx_emos & emotions) / max(1, len(ctx_emos)) if ctx_emos else 0.0
+        # 回复文字的情绪占 70%，上下文情绪占 30%。
+        return max(0.0, min(1.0, 0.70 * reply_match + 0.30 * ctx_match))
+
     def _mark_sent(self, media_id: int) -> None:
         self.store.mark_used(media_id)
 
@@ -1179,8 +1200,8 @@ class AirzMediaPlugin(star.Star):
         rows: list[dict[str, Any]],
         ctx_text: str,
         reply_text: str = "",
-    ) -> dict[int, float]:
-        """让模型给每个候选打“语境适配分”，不直接选人，发送仍由统一算法决定。"""
+    ) -> dict[int, dict[str, float]]:
+        """让模型分别给每个候选打“语境分”和“情绪分”，不直接选人。"""
         if not rows:
             return {}
         try:
@@ -1190,14 +1211,13 @@ class AirzMediaPlugin(star.Star):
         except Exception:
             return {}
         lines = [
-            "你是聊天配图语义适配评分器。先理解“本次即将发送的回复文字”真正想表达的含义、情绪和交际作用，再对每个候选独立打 0~1 分。",
-            "评分标准：",
-            "1. 0 分：含义不符、方向相反，或只是字面出现同一个词但实际意思不同（反讽、玩梗、强撑、自嘲等）。",
-            "2. 0.3 分：只有弱相关，勉强能沾边。",
-            "3. 0.6 分：含义比较适配，发出去不突兀。",
-            "4. 0.8~1 分：含义明确适配，能自然补充或强化回复想表达的意思。",
-            "禁止因为 OCR 原文/关键词与回复文字相同就打高分；必须判断真实含义是否适配。",
-            "结合最近对话判断回复文字的真实意图。每个候选都必须有分数。",
+            "你是聊天配图语义与情绪适配评分器。先理解“本次即将发送的回复文字”真正想表达的含义、情绪（如害羞、生气、开心、委屈、调侃、紧张等）和交际作用。",
+            "对每个候选分别打两个 0~1 分：",
+            "1. context：场景、真实含义、交际作用是否适合当前对话；只是字面出现同一个词但含义相反（反讽、玩梗、强撑、自嘲等）必须给 0。",
+            "2. emotion：候选的情绪/氛围是否贴合回复文字和当前对话的情绪；情绪不搭、方向相反必须给 0。",
+            "评分刻度：0=不符/相反，0.3=弱相关，0.6=比较合适，0.8~1=明确合适。",
+            "禁止因为 OCR 原文或关键词与回复文字相同就打高分；必须判断真实含义和情绪是否适配。",
+            "结合最近对话判断回复文字的真实意图。每个候选都必须有 context 和 emotion 两个分数。",
             "",
             "本次即将发送的回复文字：",
             _clean_summary(reply_text, 600) if reply_text else "（无）",
@@ -1217,20 +1237,20 @@ class AirzMediaPlugin(star.Star):
                 f"{index}. id={row['id']} 类型={'表情' if row['kind'] == 'sticker' else '图片'} "
                 f"文字={ocr} 真实含义={meaning} 情感={emos} 作用={role} 情境={scenes}"
             )
-        lines += ["", '只输出 JSON：{"scores":{"候选id":分数,...}}，不要输出解释或选择结果。']
+        lines += ["", '只输出 JSON：{"scores":{"候选id":{"context":0.0,"emotion":0.0},...}}，不要输出解释或选择结果。']
         prompt = "\n".join(lines)
         try:
             response = await asyncio.wait_for(
                 provider.text_chat(
                     prompt=prompt,
-                    system_prompt="你是严格的语义适配评分器，只输出 JSON。",
+                    system_prompt="你是严格的语义与情绪适配评分器，只输出 JSON。",
                     contexts=[],
                 ),
                 timeout=float(self.config.get("llm_timeout", 6.0)),
             )
             text = str(getattr(response, "completion_text", "") or "")
         except Exception as exc:
-            logger.info("[AIRZ-MEDIA] LLM context score failed: %s", exc)
+            logger.info("[AIRZ-MEDIA] LLM context/emotion score failed: %s", exc)
             return {}
         match = re.search(r"\{.*\}", text, re.S)
         if not match:
@@ -1241,28 +1261,36 @@ class AirzMediaPlugin(star.Star):
             return {}
         raw = data.get("scores") if isinstance(data, dict) else None
         if not isinstance(raw, dict):
-            # 兼容旧格式：{"id": 9} 视为该候选明确适配。
             if isinstance(data, dict) and data.get("id") is not None:
                 raw = {str(data["id"]): 1.0}
             else:
                 return {}
         by_id = {str(row["id"]): int(row["id"]) for row in rows}
         by_index = {str(i): int(row["id"]) for i, row in enumerate(rows, 1)}
-        scores: dict[int, float] = {}
+        scores: dict[int, dict[str, float]] = {}
         for key, value in raw.items():
             key_s = str(key)
             mid = by_id.get(key_s) or by_index.get(key_s)
             if mid is None:
                 continue
-            try:
-                fit = float(value)
-            except (TypeError, ValueError):
-                continue
-            scores[mid] = max(0.0, min(1.0, fit))
+            if isinstance(value, dict):
+                c_raw = value.get("context", value.get("semantic", value.get("fit", 0.0)))
+                e_raw = value.get("emotion", value.get("mood", c_raw))
+                try:
+                    ctx_fit = max(0.0, min(1.0, float(c_raw)))
+                    emo_fit = max(0.0, min(1.0, float(e_raw)))
+                except (TypeError, ValueError):
+                    continue
+            else:
+                try:
+                    ctx_fit = emo_fit = max(0.0, min(1.0, float(value)))
+                except (TypeError, ValueError):
+                    continue
+            scores[mid] = {"context": ctx_fit, "emotion": emo_fit}
         return scores
 
     async def _pick(self, ctx_text: str, reply_text: str = "") -> dict[str, Any] | None:
-        """统一算法：基础分 + 语境分，加权后过阈值即发送，不再掷概率。"""
+        """统一算法：基础分 + 语境分 + 情绪分；语境或情绪命中直接发送，否则按分数 + 概率兜底。"""
         rows = self.store.list_enabled(limit=300)
         if not rows:
             return None
@@ -1275,36 +1303,79 @@ class AirzMediaPlugin(star.Star):
             if not path.is_file():
                 continue
             base = self._score(row, ctx_text, ctx_emotions)
-            ctx = self._context_heuristic(row, ctx_text, reply_text)
+            h_ctx = self._context_heuristic(row, ctx_text, reply_text)
+            h_emo = self._emotion_heuristic(row, ctx_text, reply_text)
             item = dict(row)
             item["_score"] = base
-            item["_heuristic"] = ctx
+            item["_heuristic_context"] = h_ctx
+            item["_heuristic_emotion"] = h_emo
             scored.append(item)
         if not scored:
             return None
 
-        # 先用启发分取前 8 个交给模型打“语境适配分”，避免候选太多导致超时。
-        scored.sort(key=lambda x: x["_heuristic"], reverse=True)
-        llm_scores: dict[int, float] = {}
+        # 取语境/情绪启发分最高的前 8 个交给模型，分别打语境分和情绪分。
+        scored.sort(key=lambda x: max(x["_heuristic_context"], x["_heuristic_emotion"]), reverse=True)
+        llm_scores: dict[int, dict[str, float]] = {}
         if self.config.get("llm_context", True):
             llm_scores = await self._llm_context_scores(scored[:8], ctx_text, reply_text)
-        for item in scored:
-            llm_fit = float(llm_scores.get(int(item["id"]), 0.0))
-            # 模型分是主信号，启发分只做校正，防止仅字面相同就高分。
-            context = 0.70 * llm_fit + 0.30 * float(item["_heuristic"])
-            item["_llm_fit"] = llm_fit
-            item["_context"] = context
-            weight = float(self.config.get("context_weight", 0.70))
-            item["_final"] = weight * context + (1.0 - weight) * float(item["_score"])
 
-        scored.sort(key=lambda x: x["_final"], reverse=True)
+        base_w = float(self.config.get("base_weight", 0.25))
+        ctx_w = float(self.config.get("context_weight", 0.45))
+        emo_w = float(self.config.get("emotion_weight", 0.30))
+        total_w = base_w + ctx_w + emo_w
+        if total_w <= 0:
+            base_w, ctx_w, emo_w, total_w = 0.25, 0.45, 0.30, 1.0
+        fit_threshold = float(self.config.get("direct_fit_threshold", 0.80))
+
+        for item in scored:
+            mid = int(item["id"])
+            llm = llm_scores.get(mid, {})
+            llm_ctx = float(llm.get("context", 0.0))
+            llm_emo = float(llm.get("emotion", 0.0))
+            h_ctx = float(item["_heuristic_context"])
+            h_emo = float(item["_heuristic_emotion"])
+            # 模型分是主信号，启发分只做校正，防止仅字面相同就高分。
+            context = 0.70 * llm_ctx + 0.30 * h_ctx
+            emotion = 0.70 * llm_emo + 0.30 * h_emo
+            item["_llm_context"] = llm_ctx
+            item["_llm_emotion"] = llm_emo
+            item["_context"] = context
+            item["_emotion"] = emotion
+            item["_final"] = (
+                base_w * float(item["_score"]) + ctx_w * context + emo_w * emotion
+            ) / total_w
+            if llm_scores:
+                item["_context_fit"] = llm_ctx >= fit_threshold
+                item["_emotion_fit"] = llm_emo >= fit_threshold
+            else:
+                # 模型不可用时退化为启发分判定，阈值略高，避免误发。
+                item["_context_fit"] = h_ctx >= 0.70
+                item["_emotion_fit"] = h_emo >= 0.70
+
+        direct = [x for x in scored if x.get("_context_fit") or x.get("_emotion_fit")]
+        if direct:
+            direct.sort(key=lambda x: (max(float(x["_context"]), float(x["_emotion"])), float(x["_final"])), reverse=True)
+            top = direct[0]
+            logger.info(
+                "[AIRZ-MEDIA] direct send #%s context_fit=%s emotion_fit=%s context=%.2f emotion=%.2f final=%.2f",
+                top.get("id"), bool(top.get("_context_fit")), bool(top.get("_emotion_fit")),
+                float(top["_context"]), float(top["_emotion"]), float(top["_final"]),
+            )
+            return top
+
+        scored.sort(key=lambda x: float(x["_final"]), reverse=True)
         top = scored[0]
-        threshold = float(self.config.get("min_score", 0.30))
+        threshold = float(self.config.get("min_score", 0.40))
+        probability = float(self.config.get("send_probability", 0.80))
         logger.info(
-            "[AIRZ-MEDIA] pick #%s base=%.2f context=%.2f final=%.2f threshold=%.2f",
-            top.get("id"), float(top["_score"]), float(top["_context"]), float(top["_final"]), threshold,
+            "[AIRZ-MEDIA] score pick #%s base=%.2f context=%.2f emotion=%.2f final=%.2f threshold=%.2f probability=%.2f",
+            top.get("id"), float(top["_score"]), float(top["_context"]), float(top["_emotion"]),
+            float(top["_final"]), threshold, probability,
         )
-        if float(top["_final"]) < threshold:
+        if float(top["_final"]) <= threshold:
+            return None
+        if random.random() >= max(0.0, min(1.0, probability)):
+            logger.info("[AIRZ-MEDIA] score pick #%s skipped by probability", top.get("id"))
             return None
         return top
 

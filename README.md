@@ -4,11 +4,12 @@
 [![Downloads](https://img.shields.io/github/downloads/Sljh403/astrbot-plugin-meme-sender/total?label=downloads)](https://github.com/Sljh403/astrbot-plugin-meme-sender/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-AstrBot 表情包 / 本地图库自动配图插件。它会读取聊天上下文，从图库中挑选与当前回复语义适配的图片或表情包，追加在文字回复后面发送；不替换、不删除原有文字。
+AstrBot 表情包 / 本地图库自动配图插件。它会读取聊天上下文与回复情绪，从图库中挑选语境或情绪适配的图片/表情包，追加在文字回复后面发送；不替换、不删除原有文字。
 
 ## 功能介绍
 
 - **上下文自动配图**：根据最近对话和本次即将发送的回复文字，自动判断是否需要配图，并从图库中挑选语义适配的素材。
+- **情绪感知**：识别回复文字与最近对话中的情绪（开心、害羞、生气、委屈、调侃等），情绪贴合时同样可以直接配图。
 - **图库管理**：支持聊天中直接添加图片、从服务器路径导入、查看、试发、删除、重新分析；使用 SHA-256 校验内容并自动去重。
 - **表情包同步**：可从 SnowLuma / OneBot 网关同步账号收藏表情，支持保留 QQ 原生表情样式发送。
 - **图文联合分析**：提取图片中的文字（OCR）和画面内容，判断图片的真实含义、情绪、作用及推荐使用情境，结构化写入 SQLite。
@@ -36,10 +37,12 @@ AstrBot 表情包 / 本地图库自动配图插件。它会读取聊天上下文
 上下文检索匹配
   ├─ 基础分：情绪、关键词、画面/含义、情境、作用
   ├─ 语境分：回复文字与候选含义的语义适配
+  ├─ 情绪分：回复文字/上下文情绪与候选情绪的匹配
   └─ 加权得到最终分
         ↓
 决策发送
-  ├─ final >= min_score：追加图片并发送
+  ├─ 语境或情绪明确适配：直接追加图片
+  ├─ final > min_score：按 80% 概率追加最贴近的图片
   └─ 未达标：只发送文字
 ```
 
@@ -104,7 +107,7 @@ docker restart astrbot
 docker logs --tail 100 astrbot | grep -E "airz_media|AIRZ-MEDIA"
 ```
 
-看到 `Plugin airz_media (1.4.1)` 和 `[AIRZ-MEDIA] loaded` 即加载成功。
+看到 `Plugin airz_media (1.5.0)` 和 `[AIRZ-MEDIA] loaded` 即加载成功。
 
 ## 配置
 
@@ -124,8 +127,12 @@ docker logs --tail 100 astrbot | grep -E "airz_media|AIRZ-MEDIA"
   "sticker_dir": "/AstrBot/data/plugin_data/airz_media/stickers",
   "sticker_sync_count": 20,
   "native_sticker": true,
-  "min_score": 0.30,
-  "context_weight": 0.70,
+  "min_score": 0.40,
+  "base_weight": 0.25,
+  "context_weight": 0.45,
+  "emotion_weight": 0.30,
+  "send_probability": 0.80,
+  "direct_fit_threshold": 0.80,
   "allow_group": true,
   "allow_private": true,
   "max_image_mb": 10,
@@ -148,8 +155,12 @@ docker logs --tail 100 astrbot | grep -E "airz_media|AIRZ-MEDIA"
 | `sticker_dir` | 收藏表情缓存目录 |
 | `sticker_sync_count` | 每次同步收藏表情的数量，默认 20，最大 50 |
 | `native_sticker` | 表情包是否走 SnowLuma 原生 `send_custom_face` 发送 |
-| `min_score` | 统一发送阈值，默认 `0.30`；达到才配图 |
-| `context_weight` | 语境分权重，默认 `0.70`；基础分占其余部分 |
+| `min_score` | 分数兜底阈值，默认 `0.40`；语境/情绪未直发时，最终分必须高于它才可能配图 |
+| `base_weight` | 基础分权重，默认 `0.25` |
+| `context_weight` | 语境分权重，默认 `0.45` |
+| `emotion_weight` | 情绪分权重，默认 `0.30` |
+| `send_probability` | 分数兜底发送概率，默认 `0.80`，即高于阈值时有 80% 概率发送 |
+| `direct_fit_threshold` | 语境/情绪直发阈值，默认 `0.80`；任一达到即直接配图 |
 | `allow_group` / `allow_private` | 是否允许群聊 / 私聊自动配图 |
 | `max_image_mb` | 单张图片大小上限，默认 10MB |
 | `safe_filter` | 为 `true` 时跳过被标记为不安全的素材 |
@@ -158,9 +169,25 @@ docker logs --tail 100 astrbot | grep -E "airz_media|AIRZ-MEDIA"
 | `owner_ids` | 可管理图库的用户 ID 列表 |
 | `vision.timeout` | 图片分析超时，默认 45 秒 |
 
+### 发送规则
+
+```text
+base    = 0.25 × 情绪 + 0.15 × 关键词 + 0.25 × 语义 + 0.25 × 情境 + 0.10 × 作用
+context = 0.70 × 模型语境分 + 0.30 × 本地语境启发分
+emotion = 0.70 × 模型情绪分 + 0.30 × 本地情绪启发分
+
+final = 0.25 × base + 0.45 × context + 0.30 × emotion
+```
+
+1. 语境分 ≥ `direct_fit_threshold` 或 情绪分 ≥ `direct_fit_threshold`：直接配图，不看概率。
+2. 两者都未命中：按 `final` 选最贴近的素材；`final > min_score` 时，以 `send_probability` 的概率发送。
+3. 不满足以上条件：只发送文字。
+
+表情包会在基础分上额外加 `0.04`；基础分和语境分沿用原有算法，情绪分是新增维度。
+
 ### 发送频率
 
-当前版本**不限制发送次数和发送间隔**，只要最终分达到 `min_score` 就会配图。若需要限流，建议在 AstrBot 的会话策略或 QQ 网关层处理，避免插件内部再引入一套不一致的频率状态。
+当前版本**不限制发送次数和发送间隔**。若需要限流，建议在 AstrBot 的会话策略或 QQ 网关层处理，避免插件内部再引入一套不一致的频率状态。
 
 ### 图库路径
 
@@ -223,7 +250,7 @@ docker logs --tail 100 astrbot | grep -E "airz_media|AIRZ-MEDIA"
 - **图库为空**：不配图，只发送文字；`/media status` 会提示素材库为空。
 - **图片分析失败**：退回文件名/描述规则标注，标记 `ocr_status=failed`，不阻塞入库和聊天。
 - **默认模型不可用**：跳过模型分析，使用本地启发式标注；自动配图仍可继续，但更依赖已有标签。
-- **模型评分超时**：按本地启发分计算，达不到阈值就不配图，避免错误配图。
+- **模型评分超时**：按本地语境/情绪启发分计算；未达到直发条件时走分数兜底，避免错误配图。
 - **图片文件丢失**：素材在检索阶段被跳过，不影响文字回复。
 - **原生表情发送失败**：记录日志并跳过该次表情发送，文字不受影响。
 
@@ -242,7 +269,7 @@ python -m py_compile main.py
 修改后重启 AstrBot，并确认日志出现：
 
 ```text
-Plugin airz_media (1.4.1)
+Plugin airz_media (1.5.0)
 [AIRZ-MEDIA] loaded
 ```
 
