@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Plugin runtime data
+config.json
+*.db
+*.db-*
+gallery/
+stickers/
+attachments/
+logs/
+*.log
+
+# Secrets and local credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
