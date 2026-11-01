@@ -48,6 +48,10 @@ EMOTION_LEXICON: dict[str, list[str]] = {
     "调侃": ["调侃", "狗头", "乐", "笑死", "绷不住", "阴阳", "整活", "就这"],
     "生气": ["生气", "气死", "怒", "滚", "别烦", "讨厌"],
     "惊讶": ["惊讶", "卧槽", "竟然", "居然", "天啊", "没想到", "震惊"],
+    "困倦": ["困", "睡", "晚安", "睡觉", "熬夜", "想睡"],
+    "害羞": ["害羞", "脸红", "不好意思", "羞"],
+    "温柔": ["温柔", "轻声", "抱抱", "安慰"],
+    "委屈": ["委屈", "欺负", "不理我"],
 }
 STOPWORDS = {
     "图片",
@@ -71,6 +75,19 @@ STOPWORDS = {
     "未命名",
     "文件",
 }
+# 只用于给旧素材做兜底推断；新素材的 trigger_topic 由分析模型自由输出。
+TOPIC_TRIGGERS = (
+    "晚安",
+    "早安",
+    "再见",
+    "拜拜",
+    "生日快乐",
+    "新年快乐",
+    "加油",
+    "抱抱",
+    "谢谢",
+    "对不起",
+)
 
 
 def _db_default(root: Path) -> dict[str, Any]:
@@ -92,11 +109,11 @@ def _db_default(root: Path) -> dict[str, Any]:
         "max_image_mb": 10,
         "safe_filter": False,
         "llm_context": True,
-        "llm_timeout": 6.0,
+        "llm_timeout": 8.0,
+        "topic_trigger": True,
+        "topic_cooldown_seconds": 300,
         "owner_ids": [],
-        "vision": {
-            "timeout": 45,
-        },
+        "vision": {"timeout": 45},
     }
 
 
@@ -161,6 +178,66 @@ def _clean_summary(text: str, limit: int = 300) -> str:
     return text[: limit - 1] + "…"
 
 
+def _unique(items: list[str], limit: int = 12) -> list[str]:
+    out: list[str] = []
+    for item in items:
+        value = str(item or "").strip()
+        if value and value not in out:
+            out.append(value)
+    return out[:limit]
+
+
+def _labels(value: Any, limit: int = 8) -> list[str]:
+    """接受字符串 / JSON 数组 / 逗号分隔文本，保留模型自由生成的标签。"""
+    if isinstance(value, list):
+        raw = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                raw = parsed if isinstance(parsed, list) else [text]
+            except Exception:
+                raw = re.split(r"[,，、;；/|]+", text)
+        else:
+            raw = re.split(r"[,，、;；/|]+", text)
+    else:
+        raw = []
+    return _unique([str(x).strip() for x in raw if str(x).strip()], limit)
+
+
+def _segments(text: str) -> list[str]:
+    return [
+        part.strip()
+        for part in re.split(r"[\n\r。！？!?；;]+", str(text or ""))
+        if part.strip()
+    ]
+
+
+def _best_dice(needle: str, *texts: str) -> float:
+    """在整段文本和每个短句/分行上取最大相似度，避免长上下文稀释短触发词。"""
+    best = 0.0
+    for text in texts:
+        if not text:
+            continue
+        best = max(best, _dice(needle, text))
+        for segment in _segments(text):
+            best = max(best, _dice(needle, segment))
+    return min(1.0, best)
+
+
+def _infer_topics(text: str) -> list[str]:
+    return _unique([topic for topic in TOPIC_TRIGGERS if topic in str(text or "")], 8)
+
+
+def _emotion_overlap(candidate: list[str], target: list[str]) -> float:
+    cand = {x for x in candidate if x and x != "中性"}
+    targ = {x for x in target if x and x != "中性"}
+    if not cand or not targ:
+        return 0.0
+    return min(1.0, len(cand & targ) / max(1, len(cand)))
+
+
 class MediaStore:
     def __init__(self, path: Path):
         self.path = str(path)
@@ -190,6 +267,8 @@ class MediaStore:
                     interpretation TEXT DEFAULT '',
                     role TEXT DEFAULT '',
                     scenarios TEXT DEFAULT '[]',
+                    trigger_topic TEXT DEFAULT '[]',
+                    is_manual_tagged INTEGER DEFAULT 0,
                     ocr_status TEXT DEFAULT '',
                     external_id TEXT DEFAULT '',
                     source TEXT DEFAULT 'local',
@@ -198,7 +277,16 @@ class MediaStore:
                     analysis_source TEXT DEFAULT 'heuristic',
                     created_at INTEGER NOT NULL,
                     last_used INTEGER DEFAULT 0,
-                    use_count INTEGER DEFAULT 0
+                    use_count INTEGER DEFAULT 0,
+                    usage_count INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS tags (
+                    kind TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    count INTEGER DEFAULT 0,
+                    first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    PRIMARY KEY (kind, value)
                 );
                 CREATE INDEX IF NOT EXISTS idx_media_kind ON media(kind);
                 CREATE INDEX IF NOT EXISTS idx_media_enabled ON media(enabled);
@@ -213,10 +301,15 @@ class MediaStore:
                 ("interpretation", "TEXT DEFAULT ''"),
                 ("role", "TEXT DEFAULT ''"),
                 ("scenarios", "TEXT DEFAULT '[]'"),
+                ("trigger_topic", "TEXT DEFAULT '[]'"),
+                ("is_manual_tagged", "INTEGER DEFAULT 0"),
                 ("ocr_status", "TEXT DEFAULT ''"),
+                ("usage_count", "INTEGER DEFAULT 0"),
             ):
                 if name not in existing:
                     conn.execute(f"ALTER TABLE media ADD COLUMN {name} {ddl}")
+            # 旧库把原有 use_count 同步到 usage_count，避免排序失真。
+            conn.execute("UPDATE media SET usage_count=use_count WHERE usage_count=0 AND use_count>0")
             conn.commit()
 
     def get(self, media_id: int) -> dict[str, Any] | None:
@@ -291,6 +384,8 @@ class MediaStore:
         interpretation: str = "",
         role: str = "",
         scenarios: list[str] | None = None,
+        trigger_topic: list[str] | None = None,
+        is_manual_tagged: bool = False,
         ocr_status: str = "",
     ) -> None:
         with closing(self._connect()) as conn:
@@ -298,7 +393,8 @@ class MediaStore:
                 """
                 UPDATE media
                 SET description=?, emotions=?, keywords=?, analysis_source=?, safe=?,
-                    ocr_text=?, text_meaning=?, scene=?, interpretation=?, role=?, scenarios=?, ocr_status=?
+                    ocr_text=?, text_meaning=?, scene=?, interpretation=?, role=?, scenarios=?,
+                    trigger_topic=?, is_manual_tagged=?, ocr_status=?
                 WHERE id=?
                 """,
                 (
@@ -313,6 +409,8 @@ class MediaStore:
                     interpretation,
                     role,
                     json.dumps(scenarios or [], ensure_ascii=False),
+                    json.dumps(trigger_topic or [], ensure_ascii=False),
+                    1 if is_manual_tagged else 0,
                     ocr_status,
                     media_id,
                 ),
@@ -356,10 +454,39 @@ class MediaStore:
     def mark_used(self, media_id: int) -> None:
         with closing(self._connect()) as conn:
             conn.execute(
-                "UPDATE media SET last_used=?, use_count=use_count+1 WHERE id=?",
+                "UPDATE media SET last_used=?, use_count=use_count+1, "
+                "usage_count=COALESCE(usage_count, 0)+1 WHERE id=?",
                 (int(time.time()), media_id),
             )
             conn.commit()
+
+    def register_tags(self, kind: str, values: list[str]) -> None:
+        now = int(time.time())
+        items = _unique([str(v).strip() for v in values if str(v).strip()], 20)
+        if not items:
+            return
+        with closing(self._connect()) as conn:
+            for value in items:
+                conn.execute(
+                    """
+                    INSERT INTO tags (kind, value, count, first_seen, last_seen)
+                    VALUES (?, ?, 1, ?, ?)
+                    ON CONFLICT(kind, value) DO UPDATE SET
+                        count=count+1, last_seen=excluded.last_seen
+                    """,
+                    (kind, value, now, now),
+                )
+            conn.commit()
+
+    def tag_counts(self) -> dict[str, int]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT kind, COUNT(*) AS n FROM tags GROUP BY kind").fetchall()
+        return {str(row["kind"]): int(row["n"]) for row in rows}
+
+    def manual_count(self) -> int:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM media WHERE is_manual_tagged=1").fetchone()
+        return int(row["n"]) if row else 0
 
     def counts(self) -> dict[str, int]:
         with closing(self._connect()) as conn:
@@ -376,7 +503,7 @@ class MediaStore:
     name=PLUGIN_NAME,
     author="A.I.R Z",
     desc="按聊天语境自动挑选表情包或本地图库图片，支持图库管理与语义标注",
-    version="1.5.0",
+    version="1.6.0",
 )
 class AirzMediaPlugin(star.Star):
     def __init__(self, context: star.Context, config: Any = None) -> None:
@@ -389,6 +516,7 @@ class AirzMediaPlugin(star.Star):
         self.sticker_dir = self._resolve_dir(self.config.get("sticker_dir"), "stickers")
         self.store = MediaStore(self.root / "media.db")
         self._contexts: dict[str, list[dict[str, str]]] = {}
+        self._topic_last: dict[str, float] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         logger.info(
             "[AIRZ-MEDIA] loaded gallery=%s stickers=%s db=%s",
@@ -409,7 +537,14 @@ class AirzMediaPlugin(star.Star):
             except Exception as exc:
                 logger.warning("[AIRZ-MEDIA] config read failed: %s", exc)
         merged = _merge_config(default, loaded)
-        if not self.config_path.exists():
+        # 代码净化：不再保留任何 Provider/模型绑定；只保留超时。
+        vision = merged.get("vision") if isinstance(merged.get("vision"), dict) else {}
+        try:
+            vision_timeout = float(vision.get("timeout", 45))
+        except Exception:
+            vision_timeout = 45.0
+        merged["vision"] = {"timeout": vision_timeout}
+        if not self.config_path.exists() or merged != loaded:
             self._write_config(merged)
         return merged
 
@@ -470,7 +605,8 @@ class AirzMediaPlugin(star.Star):
             '{"ocr_text":"图中文字原文","ocr_status":"ok|no_text|failed",'
             '"text_meaning":"文字含义/网络梗解读","scene":"画面描述",'
             '"interpretation":"图文结合后的真实含义","emotions":["开心"],'
-            '"keywords":["猫","大笑"],"role":"表达情绪","scenarios":["对方说了蠢话时"],"safe":true}\n'
+            '"keywords":["猫","大笑"],"role":"表达情绪","scenarios":["对方说了蠢话时"],'
+            '"trigger_topic":["晚安"],"safe":true}\n'
             "规则：\n"
             "1. ocr_text 必须按阅读顺序逐字保留图中所有可读文字，包括表情包配文、字幕、贴纸文字、水印、角落小字；"
             "保留原文、标点和换行，不要翻译、改写、纠错或概括。没有任何文字时填“无文字”；文字模糊无法辨认时填“识别失败”。\n"
@@ -481,11 +617,15 @@ class AirzMediaPlugin(star.Star):
             "5. interpretation：必须同时使用文字和画面判断真实含义，明确指出二者是互补、一致、反差还是反讽；"
             "不要只复述文字，也不要只描述画面。例如画面笑脸+“我没事”通常表示强撑/自嘲；"
             "画面平静+“破防了”通常表示表面平静、内心崩溃。\n"
-            "6. emotions 只能从 开心、无语、疑惑、鼓励、调侃、难过、生气、惊讶、尴尬、中性 中选 1~3 个。\n"
-            "7. role 只能从 表达情绪、调侃对方、自嘲、缓和气氛、回应特定话题、庆祝、安慰对方、其他 中选一个。\n"
-            "8. scenarios 是 1~3 个具体使用情境，例如“对方说了蠢话时”“自己无奈时”“庆祝时”“安慰对方时”。\n"
-            "9. keywords 是 2~8 个便于检索的中文/英文词，尽量包含图中文字或梗词。\n"
-            "10. safe 仅在明确包含色情、血腥、暴力或违法内容时为 false；普通照片、截图、文字图和聊天表情包一律为 true。\n"
+            "6. emotions 是 1~3 个自由情绪标签，不要局限固定列表；必须准确描述图片本身传达的情绪，"
+            "例如 开心、害羞、委屈、得意、困倦、无语、生气、挑衅、温柔、尴尬 等都可以。\n"
+            "7. role 是图片的作用/使用情境，用自然语言给出一个短标签，例如 表达情绪、调侃对方、自嘲、"
+            "缓和气氛、回应特定话题、庆祝、安慰对方、晚安问候、嘴硬、撒娇 等；不要局限固定列表。\n"
+            "8. scenarios 是 1~5 个具体使用情境，例如“对方说晚安时”“自己无奈时”“庆祝时”“安慰对方时”。\n"
+            "9. trigger_topic 是该图片强绑定的固定话题，例如 晚安、早安、再见、生日快乐、新年快乐、加油、抱抱；"
+            "只有图片本身就是为这个话题服务时才填写，没有则填空数组 []。不要为了多触发而乱填。\n"
+            "10. keywords 是 2~8 个便于检索的中文/英文词，尽量包含图中文字或梗词。\n"
+            "11. safe 仅在明确包含色情、血腥、暴力或违法内容时为 false；普通照片、截图、文字图和聊天表情包一律为 true。\n"
             f"文件名：{filename}\n{extra}"
         )
 
@@ -506,15 +646,8 @@ class AirzMediaPlugin(star.Star):
         if not isinstance(obj, dict):
             return None
         desc = str(obj.get("description") or obj.get("desc") or fallback_desc or "聊天配图")
-        emotions = obj.get("emotions") or obj.get("emotion") or []
-        if isinstance(emotions, str):
-            emotions = [emotions]
-        keywords = obj.get("keywords") or []
-        if isinstance(keywords, str):
-            keywords = [keywords]
-        emotions = [str(x).strip() for x in emotions if str(x).strip()][:3]
-        keywords = [str(x).strip() for x in keywords if str(x).strip()][:12]
-
+        emotions = _labels(obj.get("emotions") or obj.get("emotion") or [], 3)
+        keywords = _labels(obj.get("keywords") or [], 12)
         # OCR 原文只做首尾空白清理，不能摘要、改写或截断。
         ocr_text = str(obj.get("ocr_text") or "").strip()
         ocr_status = str(obj.get("ocr_status") or "").strip().lower()
@@ -533,10 +666,11 @@ class AirzMediaPlugin(star.Star):
         scene = str(obj.get("scene") or "").strip()
         interpretation = str(obj.get("interpretation") or "").strip()
         role = str(obj.get("role") or "").strip() or "表达情绪"
-        scenarios = obj.get("scenarios") or []
-        if isinstance(scenarios, str):
-            scenarios = [scenarios]
-        scenarios = [str(x).strip() for x in scenarios if str(x).strip()][:3]
+        scenarios = _labels(obj.get("scenarios") or [], 5)
+        trigger_topic = _labels(
+            obj.get("trigger_topic") or obj.get("trigger_topics") or obj.get("topics") or [],
+            8,
+        )
 
         if not text_meaning:
             text_meaning = "无文字，仅依据画面判断" if ocr_status == "no_text" else "未给出文字解读"
@@ -546,6 +680,8 @@ class AirzMediaPlugin(star.Star):
             interpretation = scene
         if not scenarios:
             scenarios = ["日常聊天"]
+        if not trigger_topic:
+            trigger_topic = _infer_topics(" ".join([ocr_text, text_meaning, interpretation, scene]))
 
         # description 保留为一行摘要，供列表/简单匹配使用；完整字段另存。
         description = str(obj.get("description") or "").strip()
@@ -566,6 +702,7 @@ class AirzMediaPlugin(star.Star):
             "interpretation": interpretation,
             "role": role,
             "scenarios": scenarios,
+            "trigger_topic": trigger_topic,
         }
 
     def _heuristic(self, filename: str, desc: str) -> dict[str, Any]:
@@ -584,6 +721,8 @@ class AirzMediaPlugin(star.Star):
                 keywords.append(token)
         if not keywords:
             keywords = emotions[:]
+        topics = _infer_topics(text)
+        keywords = _unique(keywords + topics, 12)
         description = _clean_summary(desc or stem or "聊天配图")
         return {
             "description": description,
@@ -598,6 +737,7 @@ class AirzMediaPlugin(star.Star):
             "interpretation": description,
             "role": "表达情绪",
             "scenarios": ["日常聊天"],
+            "trigger_topic": topics,
         }
 
     async def _analyze_with_default_provider(
@@ -641,6 +781,70 @@ class AirzMediaPlugin(star.Star):
         return self._heuristic(filename, desc)
 
     # ---------- ingestion ----------
+    def _parse_manual_args(self, text: str) -> tuple[str, dict[str, Any]]:
+        """解析 /media add|import 的手动标签参数，剩余文本作为描述/路径。"""
+        manual: dict[str, Any] = {
+            "emotions": [],
+            "role": "",
+            "scenarios": [],
+            "trigger_topic": [],
+        }
+        pattern = re.compile(
+            r"--(emotion|情绪|role|作用|scenario|情境|topic|话题)\s+"
+            r"(?:\"([^\"]*)\"|“([^”]*)”|(\S+))",
+            re.I,
+        )
+        for match in pattern.finditer(text or ""):
+            flag = match.group(1).lower()
+            value = next((g for g in match.groups()[1:] if g is not None), "")
+            labels = _labels(value, 8)
+            if not labels:
+                continue
+            if flag in ("emotion", "情绪"):
+                manual["emotions"] = _unique(manual["emotions"] + labels, 6)
+            elif flag in ("role", "作用"):
+                manual["role"] = labels[0]
+            elif flag in ("scenario", "情境"):
+                manual["scenarios"] = _unique(manual["scenarios"] + labels, 6)
+            else:
+                manual["trigger_topic"] = _unique(manual["trigger_topic"] + labels, 8)
+        cleaned = re.sub(pattern, " ", text or "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned, manual
+
+    def _manual_analysis(self, desc: str, filename: str, manual: dict[str, Any]) -> dict[str, Any]:
+        emotions = _labels(manual.get("emotions") or [], 6) or ["中性"]
+        role = str(manual.get("role") or "").strip() or "表达情绪"
+        scenarios = _labels(manual.get("scenarios") or [], 6) or ["日常聊天"]
+        topics = _labels(manual.get("trigger_topic") or [], 8)
+        description = _clean_summary(desc or Path(filename).stem.replace("_", " ") or "聊天配图")
+        if not topics:
+            topics = _infer_topics(f"{description} {' '.join(scenarios)}")
+        keywords = _unique(emotions + topics + [description], 12)
+        return {
+            "description": description,
+            "emotions": emotions,
+            "keywords": keywords,
+            "safe": True,
+            "source": "manual",
+            "ocr_text": "未分析（手动标签）",
+            "ocr_status": "manual",
+            "text_meaning": "使用手动标签，未调用图片分析模型",
+            "scene": description,
+            "interpretation": description,
+            "role": role,
+            "scenarios": scenarios,
+            "trigger_topic": topics,
+        }
+
+    def _register_analysis_tags(self, analysis: dict[str, Any]) -> None:
+        self.store.register_tags("emotion", list(analysis.get("emotions") or []))
+        role = str(analysis.get("role") or "").strip()
+        if role:
+            self.store.register_tags("role", [role])
+        self.store.register_tags("scenario", list(analysis.get("scenarios") or []))
+        self.store.register_tags("topic", list(analysis.get("trigger_topic") or []))
+
     def _managed_path(self, path: Path) -> bool:
         try:
             resolved = path.resolve()
@@ -659,10 +863,18 @@ class AirzMediaPlugin(star.Star):
         umo: str,
         external_id: str = "",
         url: str = "",
+        manual: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, bool, str]:
         ext, error = self._validate_image(data)
         if not ext:
             return None, False, error
+        manual = manual or {}
+        manual_has_tags = bool(
+            manual.get("emotions")
+            or manual.get("role")
+            or manual.get("scenarios")
+            or manual.get("trigger_topic")
+        )
         sha = hashlib.sha256(data).hexdigest()
         existing = self.store.get_by_sha(sha)
         if existing:
@@ -672,6 +884,27 @@ class AirzMediaPlugin(star.Star):
                 external_id=external_id or None,
                 url=url or None,
             )
+            if manual_has_tags:
+                analysis = self._manual_analysis(desc, filename, manual)
+                self.store.update_analysis(
+                    existing["id"],
+                    description=str(analysis["description"]),
+                    emotions=list(analysis["emotions"]),
+                    keywords=list(analysis["keywords"]),
+                    source=str(analysis["source"]),
+                    safe=bool(analysis["safe"]),
+                    ocr_text=str(analysis.get("ocr_text", "")),
+                    text_meaning=str(analysis.get("text_meaning", "")),
+                    scene=str(analysis.get("scene", "")),
+                    interpretation=str(analysis.get("interpretation", "")),
+                    role=str(analysis.get("role", "")),
+                    scenarios=list(analysis.get("scenarios", [])),
+                    ocr_status=str(analysis.get("ocr_status", "")),
+                    trigger_topic=list(analysis.get("trigger_topic", [])),
+                    is_manual_tagged=True,
+                )
+                self._register_analysis_tags(analysis)
+                return self.store.get(existing["id"]), False, "已存在，已更新手动标签"
             return self.store.get(existing["id"]), False, "已存在，已更新描述"
 
         directory = self.sticker_dir if kind == "sticker" else self.gallery_dir
@@ -688,7 +921,10 @@ class AirzMediaPlugin(star.Star):
         )
         if not row:
             return None, False, "写入数据库失败。"
-        analysis = await self._analyze(data, filename, desc, umo)
+        if manual_has_tags:
+            analysis = self._manual_analysis(desc, filename, manual)
+        else:
+            analysis = await self._analyze(data, filename, desc, umo)
         self.store.update_analysis(
             row["id"],
             description=str(analysis["description"]),
@@ -703,7 +939,10 @@ class AirzMediaPlugin(star.Star):
             role=str(analysis.get("role", "")),
             scenarios=list(analysis.get("scenarios", [])),
             ocr_status=str(analysis.get("ocr_status", "")),
+            trigger_topic=list(analysis.get("trigger_topic", [])),
+            is_manual_tagged=manual_has_tags,
         )
+        self._register_analysis_tags(analysis)
         return self.store.get(row["id"]), created, ""
 
     def _can_manage(self, event: AstrMessageEvent) -> bool:
@@ -760,20 +999,25 @@ class AirzMediaPlugin(star.Star):
             return event.plain_result(self._help_text())
         if sub == "status":
             counts = self.store.counts()
-            vision = "默认模型（跟随 AstrBot 全局）"
+            tags = self.store.tag_counts()
+            vision_timeout = float((self.config.get("vision") or {}).get("timeout", 45))
             return event.plain_result(
                 f"A.I.R Z 表情图库\n"
-                f"图片：{counts['image']} 张｜表情包：{counts['sticker']} 个\n"
+                f"图片：{counts['image']} 张｜表情包：{counts['sticker']} 个｜手动标签素材：{self.store.manual_count()} 个\n"
                 f"自动发送：{'开' if self.config.get('enabled') and self.config.get('auto_send') else '关'}\n"
                 f"图库目录：{self.gallery_dir}\n"
                 f"表情目录：{self.sticker_dir}\n"
-                f"语义分析：{vision}｜分数兜底阈值：>{float(self.config.get('min_score', 0.40)):.2f}｜"
-                f"权重 基础/语境/情绪：{float(self.config.get('base_weight', 0.25)) * 100:.0f}%/"
+                f"语义分析：默认模型（跟随 AstrBot 全局）｜超时 {vision_timeout:.0f}s\n"
+                f"动态标签库：情绪 {tags.get('emotion', 0)} 个｜作用 {tags.get('role', 0)} 个｜"
+                f"情境 {tags.get('scenario', 0)} 个｜话题 {tags.get('topic', 0)} 个\n"
+                f"基础/语境/情绪权重：{float(self.config.get('base_weight', 0.25)) * 100:.0f}%/"
                 f"{float(self.config.get('context_weight', 0.45)) * 100:.0f}%/"
                 f"{float(self.config.get('emotion_weight', 0.30)) * 100:.0f}%｜"
                 f"直发：语境或情绪≥{float(self.config.get('direct_fit_threshold', 0.80)):.2f}｜"
                 f"兜底：>{float(self.config.get('min_score', 0.40)):.2f} 时 "
-                f"{float(self.config.get('send_probability', 0.80)) * 100:.0f}%｜次数/间隔：不限"
+                f"{float(self.config.get('send_probability', 0.80)) * 100:.0f}%｜次数/间隔：不限\n"
+                f"固定话题触发：{'开' if self.config.get('topic_trigger', True) else '关'}"
+                f"（冷却 {int(self.config.get('topic_cooldown_seconds', 300))} 秒）"
             )
         if sub == "list":
             kind = arg.lower().strip()
@@ -816,14 +1060,17 @@ class AirzMediaPlugin(star.Star):
         return (
             "A.I.R Z 表情图库\n"
             "/media add [描述] — 带图发送，把这张图加入图库\n"
-            "/media import <服务器路径> — 从服务器路径导入图片\n"
+            "  可加手动标签：--emotion 开心,害羞 --role 撒娇 "
+            "--scenario 对方说晚安时 --topic 晚安\n"
+            "/media import <服务器路径> — 从服务器路径导入图片，同样支持上述标签\n"
             "/media list [image|sticker] — 查看素材\n"
             "/media sync [数量] — 同步账号收藏表情（SnowLuma 网关）\n"
             "/media send <id> — 试发一个素材\n"
             "/media delete <id> — 删除素材\n"
             "/media status — 查看状态\n"
             "/media on|off — 开关自动发送\n"
-            "/media reanalyze — 重新分析素材语义\n"
+            "/media reanalyze — 重新分析未手动标注的素材语义\n"
+            "手动标签优先，带手动标签的素材不会调用图片分析模型。\n"
             "也可以用 /表情 或 /图库 代替 /media。"
         )
 
@@ -835,15 +1082,19 @@ class AirzMediaPlugin(star.Star):
         for row in rows:
             label = "表情" if row["kind"] == "sticker" else "图片"
             desc = _clean_summary(row.get("description") or Path(row["path"]).name, 40)
-            emos = "、".join(_json_list(row.get("emotions"))[:2])
+            emos = "、".join(_json_list(row.get("emotions"))[:3])
             ocr = row.get("ocr_text") or "无文字"
             ocr_status = row.get("ocr_status") or ""
             if ocr_status == "failed":
                 ocr = "识别失败（仅看画面）"
+            elif ocr_status == "manual":
+                ocr = "手动标签"
             true_meaning = _clean_summary(row.get("interpretation") or row.get("description") or "", 60)
-            lines.append(f"#{row['id']} [{label}] {desc}" + (f"（{emos}）" if emos else ""))
+            topics = "、".join(_json_list(row.get("trigger_topic"))[:3])
+            manual = "｜手动" if row.get("is_manual_tagged") else ""
+            lines.append(f"#{row['id']} [{label}] {desc}" + (f"（{emos}）" if emos else "") + manual)
             lines.append(f"  文字：{_clean_summary(ocr, 60)}")
-            lines.append(f"  含义：{true_meaning or '暂无'}")
+            lines.append(f"  含义：{true_meaning or '暂无'}" + (f"｜话题：{topics}" if topics else ""))
         if len(rows) >= 30:
             lines.append("只显示最近 30 条。")
         return "\n".join(lines)
@@ -851,6 +1102,7 @@ class AirzMediaPlugin(star.Star):
     async def _cmd_add(self, event: AstrMessageEvent, desc: str):
         if not self._can_manage(event):
             return event.plain_result("群聊里只有管理员能添加图片。")
+        desc, manual = self._parse_manual_args(desc)
         components = getattr(event.message_obj, "message", []) or []
         images = [c for c in components if isinstance(c, Image)]
         if not images:
@@ -871,9 +1123,11 @@ class AirzMediaPlugin(star.Star):
                 desc=desc,
                 source="upload",
                 umo=event.unified_msg_origin,
+                manual=manual,
             )
             if row:
-                added.append(f"#{row['id']} {row['description'][:30]}" + ("" if created else "（已存在）"))
+                manual_mark = "（手动标签）" if row.get("is_manual_tagged") else ""
+                added.append(f"#{row['id']} {row['description'][:30]}{manual_mark}" + ("" if created else "（已存在）"))
             elif message:
                 errors.append(message)
         text = "已加入图库：\n" + "\n".join(added) if added else "没有加入成功。"
@@ -882,9 +1136,14 @@ class AirzMediaPlugin(star.Star):
         return event.plain_result(text)
 
     async def _cmd_import(self, event: AstrMessageEvent, arg: str):
-        if not arg:
-            return event.plain_result("用法：/media import /服务器/图片路径.jpg")
-        path = Path(arg).expanduser()
+        clean, manual = self._parse_manual_args(arg)
+        if not clean:
+            return event.plain_result(
+                "用法：/media import /服务器/图片路径.jpg [--emotion 开心,害羞] "
+                "[--role 撒娇] [--scenario 对方说晚安时] [--topic 晚安]"
+            )
+        path_text = clean.split(maxsplit=1)[0]
+        path = Path(path_text).expanduser()
         if not path.is_absolute():
             path = self.root / path
         try:
@@ -896,18 +1155,21 @@ class AirzMediaPlugin(star.Star):
             data = path.read_bytes()
         except Exception as exc:
             return event.plain_result(f"读取失败：{exc}")
+        desc = path.stem.replace("_", " ")
         row, created, message = await self._ingest(
             data,
             kind="image",
             filename=path.name,
-            desc=path.stem.replace("_", " "),
+            desc=desc,
             source="import",
             umo=event.unified_msg_origin,
+            manual=manual,
         )
         if not row:
             return event.plain_result(message or "导入失败。")
+        manual_mark = "（手动标签）" if row.get("is_manual_tagged") else ""
         return event.plain_result(
-            f"已导入 #{row['id']}：{row['description'][:40]}" + ("" if created else "（已存在）")
+            f"已导入 #{row['id']}：{row['description'][:40]}{manual_mark}" + ("" if created else "（已存在）")
         )
 
     async def _cmd_sync(self, event: AstrMessageEvent, arg: str):
@@ -1063,7 +1325,11 @@ class AirzMediaPlugin(star.Star):
             return event.plain_result("素材库还是空的。")
         ok = 0
         failed = 0
+        skipped = 0
         for row in rows:
+            if row.get("is_manual_tagged"):
+                skipped += 1
+                continue
             try:
                 data = Path(row["path"]).read_bytes()
                 analysis = await self._analyze(
@@ -1086,11 +1352,16 @@ class AirzMediaPlugin(star.Star):
                     role=str(analysis.get("role", "")),
                     scenarios=list(analysis.get("scenarios", [])),
                     ocr_status=str(analysis.get("ocr_status", "")),
+                    trigger_topic=list(analysis.get("trigger_topic", [])),
+                    is_manual_tagged=False,
                 )
+                self._register_analysis_tags(analysis)
                 ok += 1
             except Exception:
                 failed += 1
-        return event.plain_result(f"重析完成：成功 {ok} 个，失败 {failed} 个。")
+        return event.plain_result(
+            f"重析完成：成功 {ok} 个，失败 {failed} 个，跳过手动标签 {skipped} 个。"
+        )
 
     # ---------- context / selection ----------
     @filter.on_llm_request()
@@ -1126,8 +1397,87 @@ class AirzMediaPlugin(star.Star):
         found = [name for name, words in EMOTION_LEXICON.items() if any(w in text for w in words)]
         return found or ["中性"]
 
-    def _score(self, row: dict[str, Any], ctx_text: str, ctx_emotions: list[str]) -> float:
-        emotions = {e for e in _json_list(row.get("emotions")) if e and e != "中性"}
+    def _detect_user_emotion(self, text: str) -> list[str]:
+        """从用户原话/最近对话中识别用户情绪。"""
+        emotions = self._emotions_in(text or "")
+        return [e for e in emotions if e != "中性"] or ["中性"]
+
+    def _derive_bot_emotion(
+        self,
+        user_emotions: list[str],
+        reply_text: str,
+    ) -> list[str]:
+        """根据用户情绪 + 即将发送的回复文字，推导 bot 应表现的情绪。"""
+        reply_emos = [e for e in self._emotions_in(reply_text or "") if e != "中性"]
+        mapping = {
+            "生气": ["安抚", "温和"],
+            "难过": ["安慰", "温柔"],
+            "无语": ["无奈", "调侃"],
+            "疑惑": ["耐心", "温和"],
+            "害怕": ["安抚", "温柔"],
+            "开心": ["开心", "同喜"],
+            "害羞": ["害羞", "温柔"],
+            "惊讶": ["惊讶", "调侃"],
+            "鼓励": ["鼓励", "温柔"],
+            "调侃": ["调侃", "轻松"],
+        }
+        derived: list[str] = []
+        for emotion in user_emotions:
+            derived.extend(mapping.get(emotion, []))
+        if not reply_emos and not derived:
+            derived = ["中性"]
+        return _unique(reply_emos + derived, 3) or ["中性"]
+
+    def _topic_list(self, row: dict[str, Any]) -> list[str]:
+        topics = _json_list(row.get("trigger_topic"))
+        if topics:
+            return topics
+        text = " ".join(
+            [
+                str(row.get("ocr_text") or ""),
+                str(row.get("text_meaning") or ""),
+                str(row.get("interpretation") or ""),
+                str(row.get("description") or ""),
+                " ".join(_json_list(row.get("keywords"))),
+                " ".join(_json_list(row.get("scenarios"))),
+            ]
+        )
+        return _infer_topics(text)
+
+    def _topic_conflict(self, row: dict[str, Any], bot_emotions: list[str]) -> bool:
+        """只在图片情绪与 bot 情绪明显相反时判冲突；中性/未知情绪不拦。"""
+        candidate = [e for e in _json_list(row.get("emotions")) if e and e != "中性"]
+        bot = [e for e in bot_emotions if e and e != "中性"]
+        if not candidate or not bot:
+            return False
+        positive = {"开心", "温柔", "鼓励", "调侃", "得意", "害羞", "同喜", "安慰", "安抚", "轻松"}
+        negative = {"生气", "难过", "委屈", "无语", "尴尬", "害怕", "烦", "嫌弃", "冷淡"}
+        cand_pol = 1 if any(e in positive for e in candidate) else (-1 if any(e in negative for e in candidate) else 0)
+        bot_pol = 1 if any(e in positive for e in bot) else (-1 if any(e in negative for e in bot) else 0)
+        return bool(cand_pol and bot_pol and cand_pol != bot_pol)
+
+    def _topic_is_negated(self, text: str) -> bool:
+        """识别“晚安安只是变量名/没有晚安意思”这类元语言语境，避免误触发话题直发。"""
+        t = str(text or "")
+        if not t:
+            return False
+        if re.search(r"(变量|变量名|字符串|标识符|代码|调试)", t) and re.search(r"(晚安|晚安安)", t):
+            return True
+        if "没有" in t and any(word in t for word in ("意思", "问候", "含义")):
+            return True
+        if re.search(r"(不是|并非|不代表).{0,12}(问候|意思|含义|晚安)", t):
+            return True
+        return False
+
+    def _score(
+        self,
+        row: dict[str, Any],
+        ctx_text: str,
+        bot_emotions: list[str],
+        reply_text: str = "",
+    ) -> float:
+        """基础分：只和 bot 情绪比较，回复文字也参与关键词/含义/情境匹配。"""
+        emotions = [e for e in _json_list(row.get("emotions")) if e and e != "中性"]
         keywords = _json_list(row.get("keywords"))
         description = str(row.get("description") or "")
         scene = str(row.get("scene") or "")
@@ -1136,23 +1486,19 @@ class AirzMediaPlugin(star.Star):
         ocr_text = str(row.get("ocr_text") or "")
         role = str(row.get("role") or "")
         scenarios = _json_list(row.get("scenarios"))
-        emo_score = 0.0
-        ctx_emos = {e for e in ctx_emotions if e and e != "中性"}
-        if ctx_emos and emotions:
-            emo_score = len(ctx_emos & emotions) / max(1, min(len(emotions), 2))
-        kw_hits = sum(1 for word in keywords[:6] if word and word in ctx_text)
+        target = (reply_text or "") + "\n" + (ctx_text or "")
+        emo_score = _emotion_overlap(emotions, bot_emotions)
+        kw_hits = sum(1 for word in keywords[:8] if word and word in target)
         kw_score = min(1.0, kw_hits / max(1, min(len(keywords), 3))) if keywords else 0.0
-        # 图文含义、OCR 文字、作用和使用情境都参与检索，而不是只看画面描述。
         semantic_score = max(
-            _dice(description, ctx_text),
-            _dice(scene, ctx_text),
-            _dice(interpretation, ctx_text),
-            _dice(text_meaning, ctx_text),
-            _dice(ocr_text, ctx_text) if ocr_text != "无文字" else 0.0,
+            _best_dice(description, reply_text, ctx_text),
+            _best_dice(scene, reply_text, ctx_text),
+            _best_dice(interpretation, reply_text, ctx_text),
+            _best_dice(text_meaning, reply_text, ctx_text),
+            _best_dice(ocr_text, reply_text, ctx_text) if ocr_text not in ("无文字", "识别失败", "未分析（手动标签）") else 0.0,
         )
-        scenario_score = max((_dice(s, ctx_text) for s in scenarios), default=0.0)
-        role_bonus = 0.10 if role and role in ctx_text else 0.0
-        # 基础分：画面/含义/情境合计 50%，情绪 25%，关键词 15%，作用 10%。
+        scenario_score = max((_best_dice(s, reply_text, ctx_text) for s in scenarios), default=0.0)
+        role_bonus = 0.10 if role and (role in target) else 0.0
         score = 0.25 * emo_score + 0.15 * kw_score + 0.25 * semantic_score + 0.25 * scenario_score + role_bonus
         if row.get("kind") == "sticker":
             score += 0.04
@@ -1160,7 +1506,7 @@ class AirzMediaPlugin(star.Star):
 
     def _context_heuristic(self, row: dict[str, Any], ctx_text: str, reply_text: str) -> float:
         """语境启发分：回复文字优先，考察关键词/情境/含义，不看情绪。"""
-        target = (reply_text or "") + "\n" + ctx_text
+        target = (reply_text or "") + "\n" + (ctx_text or "")
         keywords = _json_list(row.get("keywords"))
         scenarios = _json_list(row.get("scenarios"))
         interpretation = str(row.get("interpretation") or "")
@@ -1170,54 +1516,70 @@ class AirzMediaPlugin(star.Star):
         reply = reply_text or ctx_text
         kw_hits = sum(1 for word in keywords[:8] if word and word in reply)
         kw_score = min(1.0, kw_hits / max(1, min(len(keywords), 3))) if keywords else 0.0
-        scenario_score = max((_dice(s, target) for s in scenarios), default=0.0)
+        scenario_score = max((_best_dice(s, reply_text, ctx_text) for s in scenarios), default=0.0)
         semantic_score = max(
-            _dice(interpretation, target),
-            _dice(text_meaning, target),
-            _dice(scene, target),
-            _dice(ocr_text, target) if ocr_text not in ("无文字", "识别失败") else 0.0,
+            _best_dice(interpretation, reply_text, ctx_text),
+            _best_dice(text_meaning, reply_text, ctx_text),
+            _best_dice(scene, reply_text, ctx_text),
+            _best_dice(ocr_text, reply_text, ctx_text) if ocr_text not in ("无文字", "识别失败", "未分析（手动标签）") else 0.0,
         )
         # 关键词只占 30%，防止“文字里有同一个词”被当成语境适配。
         return max(0.0, min(1.0, 0.30 * kw_score + 0.35 * scenario_score + 0.35 * semantic_score))
 
-    def _emotion_heuristic(self, row: dict[str, Any], ctx_text: str, reply_text: str) -> float:
-        """情绪启发分：回复文字的情绪优先，其次看最近对话情绪与素材情绪标签的匹配。"""
-        emotions = {e for e in _json_list(row.get("emotions")) if e and e != "中性"}
-        if not emotions:
-            return 0.0
-        reply_emos = {e for e in self._emotions_in(reply_text or "") if e != "中性"}
-        ctx_emos = {e for e in self._emotions_in(ctx_text or "") if e != "中性"}
-        reply_match = len(reply_emos & emotions) / max(1, len(reply_emos)) if reply_emos else 0.0
-        ctx_match = len(ctx_emos & emotions) / max(1, len(ctx_emos)) if ctx_emos else 0.0
-        # 回复文字的情绪占 70%，上下文情绪占 30%。
-        return max(0.0, min(1.0, 0.70 * reply_match + 0.30 * ctx_match))
+    def _emotion_heuristic(self, row: dict[str, Any], bot_emotions: list[str]) -> float:
+        """情绪启发分：图片情绪只与 bot 情绪比较，绝不直接使用用户情绪。"""
+        emotions = [e for e in _json_list(row.get("emotions")) if e and e != "中性"]
+        return _emotion_overlap(emotions, bot_emotions)
 
-    def _mark_sent(self, media_id: int) -> None:
-        self.store.mark_used(media_id)
+    def _rank_candidates(
+        self,
+        items: list[dict[str, Any]],
+        primary: str,
+    ) -> list[dict[str, Any]]:
+        """综合分降序；同分用使用次数升序；再同分随机。"""
+        return sorted(
+            items,
+            key=lambda x: (
+                -float(x.get(primary, 0.0)),
+                -float(x.get("_final", 0.0)),
+                int(x.get("_usage_count", 0)),
+                random.random(),
+            ),
+        )
 
     async def _llm_context_scores(
         self,
         rows: list[dict[str, Any]],
         ctx_text: str,
         reply_text: str = "",
-    ) -> dict[int, dict[str, float]]:
-        """让模型分别给每个候选打“语境分”和“情绪分”，不直接选人。"""
+        umo: str = "",
+    ) -> dict[str, Any]:
+        """让模型分别判断用户情绪、bot 情绪，并给每个候选打语境/情绪分。"""
+        empty: dict[str, Any] = {"scores": {}, "user_emotion": [], "bot_emotion": []}
         if not rows:
-            return {}
+            return empty
         try:
-            provider = await self.context.get_using_provider_async()
+            try:
+                provider = await self.context.get_using_provider_async(umo=umo)
+            except TypeError:
+                provider = await self.context.get_using_provider_async()
             if not provider:
-                return {}
+                return empty
         except Exception:
-            return {}
+            return empty
         lines = [
-            "你是聊天配图语义与情绪适配评分器。先理解“本次即将发送的回复文字”真正想表达的含义、情绪（如害羞、生气、开心、委屈、调侃、紧张等）和交际作用。",
-            "对每个候选分别打两个 0~1 分：",
+            "你是聊天配图语义与情绪适配评分器。",
+            "第一步：判断“用户”当前的真实情绪（如害羞、生气、开心、委屈、调侃、紧张、困倦等）。",
+            "第二步：判断 bot 即将发送的回复文字应当表现什么情绪（如安抚、温柔、同喜、委屈、撒娇、调侃等）。",
+            "第三步：对每个候选分别打两个 0~1 分。图片情绪只与 bot 情绪比较，绝对不要按用户情绪选图。",
             "1. context：场景、真实含义、交际作用是否适合当前对话；只是字面出现同一个词但含义相反（反讽、玩梗、强撑、自嘲等）必须给 0。",
-            "2. emotion：候选的情绪/氛围是否贴合回复文字和当前对话的情绪；情绪不搭、方向相反必须给 0。",
+            "2. emotion：候选的情绪/氛围是否贴合 bot 情绪；情绪不搭、方向相反必须给 0。",
             "评分刻度：0=不符/相反，0.3=弱相关，0.6=比较合适，0.8~1=明确合适。",
             "禁止因为 OCR 原文或关键词与回复文字相同就打高分；必须判断真实含义和情绪是否适配。",
-            "结合最近对话判断回复文字的真实意图。每个候选都必须有 context 和 emotion 两个分数。",
+            "每个候选都必须有 context 和 emotion 两个分数。",
+            "",
+            "用户当前情绪参考（启发式，仅供校准）：",
+            "、".join(self._detect_user_emotion(ctx_text)) or "中性",
             "",
             "本次即将发送的回复文字：",
             _clean_summary(reply_text, 600) if reply_text else "（无）",
@@ -1233,11 +1595,16 @@ class AirzMediaPlugin(star.Star):
             meaning = _clean_summary(str(row.get("interpretation") or row.get("description") or ""), 100)
             role = str(row.get("role") or "")
             scenes = "、".join(_json_list(row.get("scenarios"))[:2])
+            topics = "、".join(self._topic_list(row)[:3])
             lines.append(
                 f"{index}. id={row['id']} 类型={'表情' if row['kind'] == 'sticker' else '图片'} "
-                f"文字={ocr} 真实含义={meaning} 情感={emos} 作用={role} 情境={scenes}"
+                f"文字={ocr} 真实含义={meaning} 情感={emos} 作用={role} 情境={scenes} 固定话题={topics}"
             )
-        lines += ["", '只输出 JSON：{"scores":{"候选id":{"context":0.0,"emotion":0.0},...}}，不要输出解释或选择结果。']
+        lines += [
+            "",
+            '只输出 JSON：{"user_emotion":["..."],"bot_emotion":["..."],'
+            '"scores":{"候选id":{"context":0.0,"emotion":0.0},...}}，不要输出解释或选择结果。',
+        ]
         prompt = "\n".join(lines)
         try:
             response = await asyncio.wait_for(
@@ -1246,25 +1613,29 @@ class AirzMediaPlugin(star.Star):
                     system_prompt="你是严格的语义与情绪适配评分器，只输出 JSON。",
                     contexts=[],
                 ),
-                timeout=float(self.config.get("llm_timeout", 6.0)),
+                timeout=float(self.config.get("llm_timeout", 8.0)),
             )
             text = str(getattr(response, "completion_text", "") or "")
         except Exception as exc:
             logger.info("[AIRZ-MEDIA] LLM context/emotion score failed: %s", exc)
-            return {}
+            return empty
         match = re.search(r"\{.*\}", text, re.S)
         if not match:
-            return {}
+            return empty
         try:
             data = json.loads(match.group(0))
         except Exception:
-            return {}
-        raw = data.get("scores") if isinstance(data, dict) else None
+            return empty
+        if not isinstance(data, dict):
+            return empty
+        user_emotion = _labels(data.get("user_emotion") or data.get("user_emotions") or [], 5)
+        bot_emotion = _labels(data.get("bot_emotion") or data.get("bot_emotions") or [], 5)
+        raw = data.get("scores")
         if not isinstance(raw, dict):
-            if isinstance(data, dict) and data.get("id") is not None:
+            if data.get("id") is not None:
                 raw = {str(data["id"]): 1.0}
             else:
-                return {}
+                return {"scores": {}, "user_emotion": user_emotion, "bot_emotion": bot_emotion}
         by_id = {str(row["id"]): int(row["id"]) for row in rows}
         by_index = {str(i): int(row["id"]) for i, row in enumerate(rows, 1)}
         scores: dict[int, dict[str, float]] = {}
@@ -1287,14 +1658,21 @@ class AirzMediaPlugin(star.Star):
                 except (TypeError, ValueError):
                     continue
             scores[mid] = {"context": ctx_fit, "emotion": emo_fit}
-        return scores
+        return {"scores": scores, "user_emotion": user_emotion, "bot_emotion": bot_emotion}
 
-    async def _pick(self, ctx_text: str, reply_text: str = "") -> dict[str, Any] | None:
-        """统一算法：基础分 + 语境分 + 情绪分；语境或情绪命中直接发送，否则按分数 + 概率兜底。"""
+    async def _pick(
+        self,
+        ctx_text: str,
+        reply_text: str = "",
+        umo: str = "",
+        current_text: str = "",
+    ) -> dict[str, Any] | None:
+        """统一算法：固定话题直发 → 语境/情绪直发 → 分数 + 概率兜底。"""
         rows = self.store.list_enabled(limit=300)
         if not rows:
             return None
-        ctx_emotions = self._emotions_in(ctx_text)
+        user_emotions = self._detect_user_emotion(ctx_text)
+        bot_emotions = self._derive_bot_emotion(user_emotions, reply_text)
         scored: list[dict[str, Any]] = []
         for row in rows:
             if self.config.get("safe_filter") and not bool(row.get("safe")):
@@ -1302,22 +1680,82 @@ class AirzMediaPlugin(star.Star):
             path = Path(row["path"])
             if not path.is_file():
                 continue
-            base = self._score(row, ctx_text, ctx_emotions)
+            base = self._score(row, ctx_text, bot_emotions, reply_text)
             h_ctx = self._context_heuristic(row, ctx_text, reply_text)
-            h_emo = self._emotion_heuristic(row, ctx_text, reply_text)
+            h_emo = self._emotion_heuristic(row, bot_emotions)
             item = dict(row)
             item["_score"] = base
             item["_heuristic_context"] = h_ctx
             item["_heuristic_emotion"] = h_emo
+            item["_usage_count"] = int(row.get("usage_count") or row.get("use_count") or 0)
             scored.append(item)
         if not scored:
             return None
 
+        # 固定话题优先：图片本身强绑定话题，且不与 bot 情绪明显冲突。
+        # 同一话题冷却期内，相关素材从所有发送路径中排除，避免话题直发被其他分支绕过。
+        ctx_topics = set(_infer_topics(ctx_text + "\n" + reply_text))
+        now = time.time()
+        cooldown = max(0, int(self.config.get("topic_cooldown_seconds", 300)))
+        topic_allowed = not self._topic_is_negated((current_text or "") + "\n" + reply_text)
+        if self.config.get("topic_trigger", True) and ctx_topics and cooldown > 0:
+            blocked_ids: set[int] = set()
+            for item in scored:
+                for topic in self._topic_list(item):
+                    if (
+                        topic in ctx_topics
+                        and now - float(self._topic_last.get(topic, 0)) < cooldown
+                    ):
+                        blocked_ids.add(int(item["id"]))
+                        break
+            if blocked_ids:
+                scored = [item for item in scored if int(item["id"]) not in blocked_ids]
+                if not scored:
+                    return None
+
+        if self.config.get("topic_trigger", True) and topic_allowed:
+            topic_hits: list[dict[str, Any]] = []
+            for item in scored:
+                if self._topic_conflict(item, bot_emotions):
+                    continue
+                available = [
+                    topic for topic in self._topic_list(item)
+                    if (
+                        topic in ctx_topics
+                        or topic in (ctx_text or "")
+                        or topic in (reply_text or "")
+                    )
+                    and now - float(self._topic_last.get(topic, 0)) >= cooldown
+                ]
+                if available:
+                    item["_topic_hit"] = available[0]
+                    item["_final"] = float(item["_score"])
+                    topic_hits.append(item)
+            if topic_hits:
+                top = self._rank_candidates(topic_hits, "_score")[0]
+                topic = str(top.get("_topic_hit") or "")
+                if topic:
+                    self._topic_last[topic] = now
+                logger.info(
+                    "[AIRZ-MEDIA] topic send #%s topic=%s base=%.2f manual=%s bot_emotion=%s",
+                    top.get("id"), topic, float(top["_score"]),
+                    bool(top.get("is_manual_tagged")), "、".join(bot_emotions),
+                )
+                return top
+
         # 取语境/情绪启发分最高的前 8 个交给模型，分别打语境分和情绪分。
         scored.sort(key=lambda x: max(x["_heuristic_context"], x["_heuristic_emotion"]), reverse=True)
-        llm_scores: dict[int, dict[str, float]] = {}
+        llm_data: dict[str, Any] = {"scores": {}, "user_emotion": [], "bot_emotion": []}
         if self.config.get("llm_context", True):
-            llm_scores = await self._llm_context_scores(scored[:8], ctx_text, reply_text)
+            llm_data = await self._llm_context_scores(scored[:8], ctx_text, reply_text, umo)
+        llm_scores: dict[int, dict[str, float]] = llm_data.get("scores") or {}
+        model_bot = _labels(llm_data.get("bot_emotion") or [], 5)
+        if model_bot:
+            bot_emotions = model_bot
+            # bot 情绪变了，重算基础分与情绪启发分。
+            for item in scored:
+                item["_score"] = self._score(item, ctx_text, bot_emotions, reply_text)
+                item["_heuristic_emotion"] = self._emotion_heuristic(item, bot_emotions)
 
         base_w = float(self.config.get("base_weight", 0.25))
         ctx_w = float(self.config.get("context_weight", 0.45))
@@ -1334,9 +1772,9 @@ class AirzMediaPlugin(star.Star):
             llm_emo = float(llm.get("emotion", 0.0))
             h_ctx = float(item["_heuristic_context"])
             h_emo = float(item["_heuristic_emotion"])
-            # 模型分是主信号，启发分只做校正，防止仅字面相同就高分。
-            context = 0.70 * llm_ctx + 0.30 * h_ctx
-            emotion = 0.70 * llm_emo + 0.30 * h_emo
+            # 模型分是主信号；模型不可用时完全退化为启发分，不伪造 0 分。
+            context = 0.70 * llm_ctx + 0.30 * h_ctx if llm else h_ctx
+            emotion = 0.70 * llm_emo + 0.30 * h_emo if llm else h_emo
             item["_llm_context"] = llm_ctx
             item["_llm_emotion"] = llm_emo
             item["_context"] = context
@@ -1344,33 +1782,48 @@ class AirzMediaPlugin(star.Star):
             item["_final"] = (
                 base_w * float(item["_score"]) + ctx_w * context + emo_w * emotion
             ) / total_w
-            if llm_scores:
-                item["_context_fit"] = llm_ctx >= fit_threshold
-                item["_emotion_fit"] = llm_emo >= fit_threshold
-            else:
-                # 模型不可用时退化为启发分判定，阈值略高，避免误发。
-                item["_context_fit"] = h_ctx >= 0.70
-                item["_emotion_fit"] = h_emo >= 0.70
+            item["_context_fit"] = context >= fit_threshold
+            item["_emotion_fit"] = emotion >= fit_threshold
 
         direct = [x for x in scored if x.get("_context_fit") or x.get("_emotion_fit")]
         if direct:
-            direct.sort(key=lambda x: (max(float(x["_context"]), float(x["_emotion"])), float(x["_final"])), reverse=True)
+            direct.sort(
+                key=lambda x: (
+                    -max(float(x["_context"]), float(x["_emotion"])),
+                    -float(x["_final"]),
+                    int(x["_usage_count"]),
+                    random.random(),
+                )
+            )
             top = direct[0]
             logger.info(
-                "[AIRZ-MEDIA] direct send #%s context_fit=%s emotion_fit=%s context=%.2f emotion=%.2f final=%.2f",
+                "[AIRZ-MEDIA] direct send #%s context_fit=%s emotion_fit=%s "
+                "context=%.2f emotion=%.2f final=%.2f manual=%s "
+                "user_emotion=%s bot_emotion=%s",
                 top.get("id"), bool(top.get("_context_fit")), bool(top.get("_emotion_fit")),
                 float(top["_context"]), float(top["_emotion"]), float(top["_final"]),
+                bool(top.get("is_manual_tagged")),
+                "、".join(user_emotions), "、".join(bot_emotions),
             )
             return top
 
-        scored.sort(key=lambda x: float(x["_final"]), reverse=True)
+        scored.sort(
+            key=lambda x: (
+                -float(x["_final"]),
+                int(x["_usage_count"]),
+                random.random(),
+            )
+        )
         top = scored[0]
         threshold = float(self.config.get("min_score", 0.40))
         probability = float(self.config.get("send_probability", 0.80))
         logger.info(
-            "[AIRZ-MEDIA] score pick #%s base=%.2f context=%.2f emotion=%.2f final=%.2f threshold=%.2f probability=%.2f",
+            "[AIRZ-MEDIA] score pick #%s base=%.2f context=%.2f emotion=%.2f final=%.2f "
+            "threshold=%.2f probability=%.2f manual=%s user_emotion=%s bot_emotion=%s",
             top.get("id"), float(top["_score"]), float(top["_context"]), float(top["_emotion"]),
             float(top["_final"]), threshold, probability,
+            bool(top.get("is_manual_tagged")),
+            "、".join(user_emotions), "、".join(bot_emotions),
         )
         if float(top["_final"]) <= threshold:
             return None
@@ -1405,10 +1858,10 @@ class AirzMediaPlugin(star.Star):
         current = (event.message_str or "").strip()
         if current:
             ctx_text = (ctx_text + "\nuser: " + current).strip()
-        chosen = await self._pick(ctx_text, reply_text=text)
+        chosen = await self._pick(ctx_text, reply_text=text, umo=umo, current_text=current)
         if not chosen:
             return
-        self._mark_sent(int(chosen["id"]))
+        self.store.mark_used(int(chosen["id"]))
         event.set_extra("airz_media_handled", True)
         path = Path(chosen["path"])
         use_native = (

@@ -1,6 +1,6 @@
 name: airz_media
 display_name: A.I.R Z 表情图库
-desc: 基于聊天语境与情绪自动挑选表情包和本地图库图片，支持图库管理、图文分析、语境/情绪匹配与自动配图
-version: 1.5.0
+desc: 基于聊天语境、双情绪与固定话题自动挑选表情包和本地图库图片，支持手动/动态标签、图库管理与图文分析
+version: 1.6.0
 author: A.I.R Z
 astrbot_version: ">=4.29.0,<5.0.0"
